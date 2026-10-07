@@ -71,6 +71,7 @@
       <input id="xf" type="range" min="0" max="10" step="0.5" value="2">
       <span id="xfv">2.0s</span>
     </label>
+    <label><input id="boom" type="checkbox"> 💥 Explosion at the end</label>
     <span class="spacer"></span>
     <span id="total">Mix length 0:00.0</span>
     <button id="export" class="green" disabled>⬇ Export WAV</button>
@@ -111,6 +112,14 @@ const parseTime = (str) => {
 };
 const setStatus = (msg) => { $('#status').textContent = msg || ''; };
 
+/* Filename hints -> ranges (seconds). Files whose names match are auto-trimmed and ordered. */
+const PLAN = [
+  { re: /vaca|mala\s*fe/i,                  parts: [[0, 83]] },            // La Vaca 0:00-1:23
+  { re: /vuelve|teodoro|pap[aá]/i,           parts: [[8, 78]] },            // Bachata 0:08-1:18
+  { re: /mentirosa|r[aá]faga/i,              parts: [[0, 65]] },            // Cumbia 0:00-1:05
+  { re: /guatauba|plan\s*b/i,               parts: [[0, 35], [11, 29]], boom: true }, // Reggaeton
+];
+
 /* ---------- adding files ---------- */
 async function addFiles(files) {
   const c = getCtx();
@@ -121,12 +130,23 @@ async function addFiles(files) {
       const buffer = await c.decodeAudioData(await f.arrayBuffer());
       const t = { id: nextId++, name: f.name.replace(/\.[^.]+$/, ''), buffer, start: 0,
                   end: Math.min(buffer.duration, 30), vol: 1, peaks: null, w: 0 };
-      tracks.push(t);
+      const pi = PLAN.findIndex((p) => p.re.test(f.name));
+      if (pi >= 0) {
+        const parts = PLAN[pi].parts;
+        parts.forEach(([s, e], k) => {
+          const tt = { ...t, id: k ? nextId++ : t.id, plan: pi, peaks: null, w: 0,
+                       start: Math.min(s, buffer.duration - 0.1), end: Math.min(e, buffer.duration) };
+          tracks.push(tt);
+        });
+        if (PLAN[pi].boom) $('#boom').checked = true;
+      } else tracks.push(t);
     } catch (e) {
       alert('Could not decode "' + f.name + '". Try mp3, wav, or m4a.');
     }
   }
   setStatus('');
+  if (tracks.some((t) => t.plan !== undefined))
+    tracks.sort((a, b) => (a.plan ?? 99) - (b.plan ?? 99)); // stable: keeps part order
   render();
 }
 
@@ -138,7 +158,8 @@ fileInput.onchange = () => { addFiles([...fileInput.files]); fileInput.value = '
 drop.addEventListener('drop', (ev) => addFiles([...ev.dataTransfer.files]));
 
 /* ---------- mix scheduling (shared by live play and export) ---------- */
-function layout(list, xf) {
+const BOOM_TAIL = 2.6;
+function layout(list, xf, boom) {
   // returns start time of each clip on the mix timeline plus the fade used at each joint
   const items = [];
   let t = 0;
@@ -153,12 +174,31 @@ function layout(list, xf) {
     items.push({ tr, len, at: t, fadeIn, fadeOut: 0 });
   });
   for (let i = 0; i < items.length - 1; i++) items[i].fadeOut = items[i + 1].fadeIn;
-  const total = items.length ? Math.max(...items.map((x) => x.at + x.len)) : 0;
-  return { items, total };
+  const music = items.length ? Math.max(...items.map((x) => x.at + x.len)) : 0;
+  const total = music + (boom && items.length ? BOOM_TAIL - 0.1 : 0);
+  return { items, music, total };
 }
 
-function schedule(c, dest, list, xf, t0) {
-  const { items, total } = layout(list, xf);
+function synthExplosion(c, dest, when) {
+  const dur = BOOM_TAIL, n = Math.floor(c.sampleRate * dur);
+  const nb = c.createBuffer(1, n, c.sampleRate), d = nb.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 2.5);
+  const noise = c.createBufferSource(); noise.buffer = nb;
+  const lp = c.createBiquadFilter(); lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(6000, when); lp.frequency.exponentialRampToValueAtTime(120, when + dur);
+  const ng = c.createGain(); ng.gain.value = 0.9;
+  noise.connect(lp).connect(ng).connect(dest);
+  const osc = c.createOscillator(); osc.type = 'sine';
+  osc.frequency.setValueAtTime(110, when); osc.frequency.exponentialRampToValueAtTime(35, when + 1.2);
+  const og = c.createGain();
+  og.gain.setValueAtTime(0.9, when); og.gain.exponentialRampToValueAtTime(0.001, when + 1.5);
+  osc.connect(og).connect(dest);
+  osc.start(when); osc.stop(when + 1.5); noise.start(when);
+  return noise;
+}
+
+function schedule(c, dest, list, xf, t0, boom) {
+  const { items, music, total } = layout(list, xf, boom);
   const sources = [];
   for (const it of items) {
     const src = c.createBufferSource();
@@ -176,6 +216,7 @@ function schedule(c, dest, list, xf, t0) {
     src.start(a, it.tr.start, it.len);
     sources.push(src);
   }
+  if (boom && items.length) sources.push(synthExplosion(c, dest, t0 + music - 0.1));
   return { sources, items, total };
 }
 
@@ -193,14 +234,14 @@ function stopPlayback() {
   updateButtons();
 }
 
-function play(list, xf, label) {
+function play(list, xf, label, boom = false) {
   stopPlayback();
   if (!list.length) return;
   const c = getCtx();
   const master = c.createGain();
   master.connect(c.destination);
   const t0 = c.currentTime + 0.08;
-  const { sources, items, total } = schedule(c, master, list, xf, t0);
+  const { sources, items, total } = schedule(c, master, list, xf, t0, boom);
   player = { sources, master, t0, total, items, label };
   sources[sources.length - 1].onended = () => { if (player && player.sources === sources) stopPlayback(); };
   if (label === 'mix') $('#playMix').textContent = '⏸ Pause'; // acts as stop
@@ -309,6 +350,7 @@ function render() {
         <div class="name"></div>
         <button class="icon up" title="Move up">↑</button>
         <button class="icon down" title="Move down">↓</button>
+        <button class="icon dup" title="Add another part of this song after this one">＋ Another part</button>
         <button class="icon rm" title="Remove">✕</button>
       </div>
       <div class="wave"><canvas></canvas><div class="ph"></div></div>
@@ -335,6 +377,13 @@ function render() {
     sIn.onchange = eIn.onchange = commit;
     el.querySelector('.vol').oninput = (ev) => { tr.vol = +ev.target.value; };
     el.querySelector('.pv').onclick = () => play([tr], 0, 'preview');
+    el.querySelector('.dup').onclick = () => {
+      stopPlayback();
+      const d = tr.buffer.duration, s0 = Math.min(tr.start + 11, d - 1);
+      tracks.splice(i + 1, 0, { id: nextId++, name: tr.name, buffer: tr.buffer, start: s0,
+        end: Math.min(d, s0 + Math.max(1, (tr.end - tr.start) / 2)), vol: tr.vol, peaks: null, w: 0, plan: tr.plan });
+      render();
+    };
     el.querySelector('.rm').onclick = () => { stopPlayback(); tracks.splice(i, 1); render(); };
     el.querySelector('.up').onclick = () => { if (i > 0) { stopPlayback(); [tracks[i - 1], tracks[i]] = [tracks[i], tracks[i - 1]]; render(); } };
     el.querySelector('.down').onclick = () => { if (i < tracks.length - 1) { stopPlayback(); [tracks[i + 1], tracks[i]] = [tracks[i], tracks[i + 1]]; render(); } };
@@ -346,7 +395,7 @@ function render() {
 
 function refreshSummary() {
   const xf = +$('#xf').value;
-  const { items, total } = layout(tracks, xf);
+  const { items, music, total } = layout(tracks, xf, $('#boom').checked);
   $('#total').textContent = 'Mix length ' + fmt(total);
   const tl = $('#timeline');
   tl.querySelectorAll('.seg').forEach((e) => e.remove());
@@ -359,6 +408,15 @@ function refreshSummary() {
     d.textContent = i + 1 + '. ' + it.tr.name;
     tl.appendChild(d);
   });
+  if ($('#boom').checked && items.length) {
+    const d = document.createElement('div');
+    d.className = 'seg';
+    d.style.left = ((music - 0.1) / total) * 100 + '%';
+    d.style.width = ((total - music + 0.1) / total) * 100 + '%';
+    d.style.background = '#ff5c7a';
+    d.textContent = '💥';
+    tl.appendChild(d);
+  }
   updateButtons();
 }
 
@@ -370,7 +428,8 @@ function updateButtons() {
 }
 
 $('#xf').oninput = () => { $('#xfv').textContent = (+$('#xf').value).toFixed(1) + 's'; refreshSummary(); };
-$('#playMix').onclick = () => { if (player && player.label === 'mix') stopPlayback(); else play(tracks, +$('#xf').value, 'mix'); };
+$('#playMix').onclick = () => { if (player && player.label === 'mix') stopPlayback(); else play(tracks, +$('#xf').value, 'mix', $('#boom').checked); };
+$('#boom').onchange = refreshSummary;
 $('#stop').onclick = stopPlayback;
 window.addEventListener('resize', () => {
   document.querySelectorAll('.track').forEach((el) => {
@@ -401,12 +460,13 @@ function encodeWav(buf) {
 $('#export').onclick = async () => {
   stopPlayback();
   const xf = +$('#xf').value, sr = 44100;
-  const { total } = layout(tracks, xf);
+  const boom = $('#boom').checked;
+  const { total } = layout(tracks, xf, boom);
   setStatus('Rendering mix…');
   $('#export').disabled = true;
   try {
     const off = new OfflineAudioContext(2, Math.ceil(total * sr) + 1, sr);
-    schedule(off, off.destination, tracks, xf, 0);
+    schedule(off, off.destination, tracks, xf, 0, boom);
     const rendered = await off.startRendering();
     const a = document.createElement('a');
     a.href = URL.createObjectURL(encodeWav(rendered));
